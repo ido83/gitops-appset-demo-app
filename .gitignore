@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+env/
+venv/
+.venv/
+/.venv/
+.env
+.env.*
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dist/
+
+# Docker
+docker-compose.override.yml
+docker-compose.local.yml
+
+# IDEs / editors
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives / packages
+*.tgz
+*.zip
+
+# GitOps / Helm / k8s
+charts/*.tgz
+secrets/
+*.crt
+*.key
+
+# Misc
+.cache/
+.pytest_cache/
+coverage/
+coverage.*

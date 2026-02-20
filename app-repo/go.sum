@@ -1,0 +1,2 @@
+# This project has no external dependencies.
+# go.sum is intentionally empty (and valid) because we use only the Go standard library.

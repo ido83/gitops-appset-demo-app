@@ -1,0 +1,14 @@
+# Ignore VCS and local/editor artifacts to keep build context small and cache-friendly.
+.git
+.gitignore
+.idea
+.vscode
+
+# CI/build outputs
+bin
+dist
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db

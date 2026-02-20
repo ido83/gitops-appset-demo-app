@@ -1,0 +1,285 @@
+/*
+  Production-oriented Declarative Pipeline that:
+  - builds a container image tagged with a short Git SHA (or a provided tag for promotion)
+  - pushes it to a registry
+  - updates gitops-repo values.yaml (the GitOps promotion anchor), commits, and pushes
+
+  This pipeline is designed to run on Jenkins with the Kubernetes plugin (pod-based agents)
+  and avoids Docker-in-Docker by using Kaniko for builds (safer, no privileged Docker socket).
+
+  Required Jenkins credentials:
+  1) registry-docker-config  (Secret file)  -> Docker config.json for registry auth
+  2) gitops-repo-ssh         (SSH private key) -> allows pushing to gitops-repo over SSH
+*/
+
+pipeline {
+  agent {
+    kubernetes {
+      defaultContainer 'jnlp'
+
+      // Inline Pod template so the repo is self-contained.
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: jenkins-kaniko-gitops
+spec:
+  serviceAccountName: jenkins
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  volumes:
+    # Kaniko reads docker auth from /kaniko/.docker/config.json
+    - name: kaniko-docker-config
+      emptyDir: {}
+  containers:
+    - name: golang
+      image: golang:1.22-alpine
+      command: ["sh", "-c", "cat"]
+      tty: true
+    - name: git
+      image: alpine/git:2.45.2
+      command: ["sh", "-c", "cat"]
+      tty: true
+    - name: yq
+      image: mikefarah/yq:4.44.3
+      command: ["sh", "-c", "cat"]
+      tty: true
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:v1.23.2-debug
+      command: ["sh", "-c", "cat"]
+      tty: true
+      volumeMounts:
+        - name: kaniko-docker-config
+          mountPath: /kaniko/.docker
+"""
+    }
+  }
+
+  options {
+    // Keep logs readable and avoid concurrent writes to the same GitOps anchor.
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  parameters {
+    choice(
+      name: 'TARGET_ENV',
+      choices: ['dev', 'staging', 'prod'],
+      description: 'Which GitOps environment values.yaml should be updated (promotion anchor).'
+    )
+
+    string(
+      name: 'IMAGE_TAG',
+      defaultValue: '',
+      description: 'Optional: promote an existing image tag (SHA) without rebuilding. If empty, build from current commit SHA.'
+    )
+
+    booleanParam(
+      name: 'SKIP_GITOPS_UPDATE',
+      defaultValue: false,
+      description: 'If true, do not update gitops-repo (useful for PR preview builds where ArgoCD PR generator deploys by tag).'
+    )
+  }
+
+  environment {
+    // Change these to match your registry and repos.
+    APP_NAME         = "hello-web"
+    IMAGE_REPOSITORY = "ghcr.io/example-org/hello-web"      // Example; use your registry path.
+    GITOPS_REPO_SSH  = "git@github.com:example-org/gitops-repo.git"
+    GITOPS_BRANCH    = "main"
+
+    // GitOps anchor file pattern in gitops-repo (updated by this pipeline).
+    GITOPS_VALUES_FILE = "apps/${APP_NAME}/${params.TARGET_ENV}/values.yaml"
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        // Jenkins checks out app-repo.
+        checkout scm
+      }
+    }
+
+    stage('Compute Build Metadata') {
+      steps {
+        container('git') {
+          script {
+            // Short SHA is the safest immutable tag to ensure we promote exact artifacts.
+            def sha = sh(returnStdout: true, script: "git rev-parse --short=8 HEAD").trim()
+            env.COMMIT_SHA_SHORT = sha
+
+            // Version is optional; here we derive a readable version for the runtime response.
+            // In real setups you may use SemVer tags or a build system.
+            env.APP_VERSION = "0.1.0+${sha}"
+
+            // If IMAGE_TAG was provided, we are promoting an existing artifact and must not rebuild.
+            if (params.IMAGE_TAG?.trim()) {
+              env.EFFECTIVE_IMAGE_TAG = params.IMAGE_TAG.trim()
+              env.DO_BUILD = "false"
+            } else {
+              env.EFFECTIVE_IMAGE_TAG = sha
+              env.DO_BUILD = "true"
+            }
+
+            echo "COMMIT_SHA_SHORT=${env.COMMIT_SHA_SHORT}"
+            echo "APP_VERSION=${env.APP_VERSION}"
+            echo "EFFECTIVE_IMAGE_TAG=${env.EFFECTIVE_IMAGE_TAG}"
+            echo "DO_BUILD=${env.DO_BUILD}"
+          }
+        }
+      }
+    }
+
+    stage('Unit Tests') {
+      when {
+        expression { return env.DO_BUILD == "true" }
+      }
+      steps {
+        container('golang') {
+          sh """
+            set -eu
+            go test ./...
+          """
+        }
+      }
+    }
+
+    stage('Build & Push Image (Kaniko)') {
+      when {
+        expression { return env.DO_BUILD == "true" }
+      }
+      steps {
+        // Provide docker config.json to Kaniko via a Jenkins "Secret file" credential.
+        withCredentials([file(credentialsId: 'registry-docker-config', variable: 'DOCKER_CONFIG_JSON')]) {
+          container('kaniko') {
+            sh """
+              set -eu
+
+              # Kaniko expects docker auth at /kaniko/.docker/config.json
+              cp "\$DOCKER_CONFIG_JSON" /kaniko/.docker/config.json
+
+              # Build time string for traceability.
+              BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+              # Kaniko builds and pushes in one step (no Docker daemon needed).
+              /kaniko/executor \\
+                --context "\$PWD" \\
+                --dockerfile "\$PWD/Dockerfile" \\
+                --destination "${IMAGE_REPOSITORY}:${EFFECTIVE_IMAGE_TAG}" \\
+                --build-arg "VERSION=${APP_VERSION}" \\
+                --build-arg "GIT_SHA=${EFFECTIVE_IMAGE_TAG}" \\
+                --build-arg "BUILD_TIME=\${BUILD_TIME}" \\
+                --snapshotMode=redo \\
+                --use-new-run \\
+                --cleanup
+
+              echo "Pushed image: ${IMAGE_REPOSITORY}:${EFFECTIVE_IMAGE_TAG}"
+            """
+          }
+        }
+      }
+    }
+
+    stage('Gate: Non-Dev Promotion') {
+      when {
+        allOf {
+          expression { return params.TARGET_ENV != 'dev' }
+          expression { return params.SKIP_GITOPS_UPDATE == false }
+        }
+      }
+      steps {
+        // Production best practice: require an explicit human approval for staging/prod promotions.
+        input message: "Promote image tag '${env.EFFECTIVE_IMAGE_TAG}' to ${params.TARGET_ENV} by updating gitops-repo?",
+              ok: "Promote"
+      }
+    }
+
+    stage('Update GitOps Anchor (gitops-repo)') {
+      when {
+        expression { return params.SKIP_GITOPS_UPDATE == false }
+      }
+      steps {
+        container('git') {
+          // sshagent provides SSH key to git for cloning/pushing.
+          sshagent(credentials: ['gitops-repo-ssh']) {
+            sh """
+              set -eu
+
+              # Install SSH client (alpine/git image is minimal).
+              apk add --no-cache openssh-client >/dev/null
+
+              rm -rf gitops-repo
+              git clone --branch "${GITOPS_BRANCH}" "${GITOPS_REPO_SSH}" gitops-repo
+
+              cd gitops-repo
+
+              # Ensure we are on the expected branch.
+              git checkout "${GITOPS_BRANCH}"
+
+              # Sanity check: the target file must exist (prevents accidental writes to wrong paths).
+              if [ ! -f "${GITOPS_VALUES_FILE}" ]; then
+                echo "ERROR: Expected GitOps values file not found: ${GITOPS_VALUES_FILE}" >&2
+                echo "Hint: Ensure gitops-repo contains apps/${APP_NAME}/${params.TARGET_ENV}/values.yaml" >&2
+                exit 1
+              fi
+
+              echo "Updating ${GITOPS_VALUES_FILE} -> image.tag=${EFFECTIVE_IMAGE_TAG}"
+            """
+          }
+        }
+
+        // Use yq for safe YAML edits (avoid fragile sed/regex on YAML).
+        container('yq') {
+          sh """
+            set -eu
+            cd gitops-repo
+
+            # Update only the image.tag field — this is the immutable promotion anchor.
+            yq -i '.image.tag = "${EFFECTIVE_IMAGE_TAG}"' "${GITOPS_VALUES_FILE}"
+
+            # Optionally store an informational annotation/field for humans (not used by Helm templates).
+            # Keeping metadata in values helps traceability during audits.
+            yq -i '.appMetadata.lastPromotedTag = "${EFFECTIVE_IMAGE_TAG}"' "${GITOPS_VALUES_FILE}"
+          """
+        }
+
+        container('git') {
+          sshagent(credentials: ['gitops-repo-ssh']) {
+            sh """
+              set -eu
+              cd gitops-repo
+
+              # Commit only if there is a change (idempotent pipeline runs).
+              if git diff --quiet; then
+                echo "No GitOps changes detected; nothing to commit."
+                exit 0
+              fi
+
+              git config user.name  "jenkins-bot"
+              git config user.email "jenkins-bot@example.org"
+
+              git add "${GITOPS_VALUES_FILE}"
+              git commit -m "chore(gitops): promote ${APP_NAME} to ${params.TARGET_ENV} -> ${EFFECTIVE_IMAGE_TAG}"
+
+              # Pushing to gitops-repo is what triggers Argo CD reconciliation (GitOps pull model).
+              git push origin "${GITOPS_BRANCH}"
+
+              echo "GitOps anchor updated and pushed."
+            """
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Build complete. Image tag: ${env.EFFECTIVE_IMAGE_TAG}"
+    }
+  }
+}

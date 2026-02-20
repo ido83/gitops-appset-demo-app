@@ -1,0 +1,9 @@
+app-repo/
+├── .dockerignore
+├── Dockerfile
+├── Jenkinsfile
+├── go.mod
+├── go.sum
+└── cmd/
+    └── hello-web/
+        └── main.go
